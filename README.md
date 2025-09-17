@@ -82,7 +82,7 @@
 
 ### 4. 성능 평가
 - 평가 지표: **RMSE (Root Mean Squared Error)**
-- 최종 RMSE: **약 0.21 (정규화 스케일)**
+- 최종 RMSE(리더보드): ** 0.91972 (정규화 스케일)**
 
 **Feature Importance (상위 변수):**
 1. 배터리 용량 (`battery_capacity`)
