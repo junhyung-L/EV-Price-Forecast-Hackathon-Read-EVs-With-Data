@@ -1,1 +1,1 @@
-# EV-Price-Forecast-Hackathon-Read-EVs-With-Data
+# 전기차 가격 예측 해커톤: 데이터로 EV를 읽다!
