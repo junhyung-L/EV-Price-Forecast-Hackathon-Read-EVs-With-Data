@@ -1,291 +1,121 @@
+"""Train a portable XGBoost baseline and create an EV-price submission CSV.
+
+The original competition notebook remains under ``notebooks/``. This CLI
+replaces its machine-specific export; the competition data is not versioned.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from xgboost import XGBRegressor
+
+try:
+    from .config import RANDOM_SEED, TEST_CSV, TEST_SIZE, TRAIN_CSV, result_path
+except ImportError:  # Supports ``python src/ev_price_prediction_xgb.py``.
+    from config import RANDOM_SEED, TEST_CSV, TEST_SIZE, TRAIN_CSV, result_path
+
+TARGET = "가격(백만원)"
+ID_COLUMN = "ID"
+BATTERY = "배터리용량"
 
 
-# ====================import pandas as pd
-train=pd.read_csv("C:/Users/user/Desktop/open/train.csv")
-test=pd.read_csv("C:/Users/user/Desktop/open/test.csv")
-
-train.info()
-test.info()
-
-train1=train.copy()
-test1=test.copy()
-
-train1
-
-def create_improved_features(data):
-    
-    data['제조사_모델_상태'] = data['제조사'] + '_' + data['모델']+ '_' + data['차량상태']
-    
-    data['주행거리비율'] = data.apply(
-        lambda row: row['주행거리(km)'] if row['연식(년)'] == 0 else row['주행거리(km)'] / row['연식(년)'],
-        axis=1)
-    
-    current_year = 2025 
-    data['사용연한주행거리비율'] = data['주행거리(km)'] / (current_year - data['연식(년)'] + 1)
-
-    data['전비(km/kWh)'] = data['주행거리(km)'] / data['배터리용량']
-    
-    data['중고여부'] = data['차량상태'].apply(lambda x: 0 if x == 'Brand New' else 1)
-    
-    drive_weight = {'AWD': 1.2, 'RWD': 1.1, 'FWD': 1.0}
-    data['구동방식가중치'] = data['구동방식'].map(drive_weight)
-    
-    data['사고가중치'] = data['사고이력'].apply(lambda x: 1 if x == 'Yes' else 0)
-    
+def add_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Create documented features only when their source columns are present."""
+    data = frame.copy()
+    if {"제조사", "모델", "차량상태"}.issubset(data):
+        data["제조사_모델_상태"] = data[["제조사", "모델", "차량상태"]].astype(str).agg("_".join, axis=1)
+    if {"주행거리(km)", "연식(년)"}.issubset(data):
+        age = pd.to_numeric(data["연식(년)"], errors="coerce").clip(lower=0)
+        mileage = pd.to_numeric(data["주행거리(km)"], errors="coerce")
+        data["주행거리비율"] = mileage.div(age.mask(age.eq(0)))
+        data["사용연한주행거리비율"] = mileage.div(age.add(1))
+    if {"주행거리(km)", BATTERY}.issubset(data):
+        battery = pd.to_numeric(data[BATTERY], errors="coerce").mask(lambda value: value.eq(0))
+        data["전비(km/kWh)"] = pd.to_numeric(data["주행거리(km)"], errors="coerce").div(battery)
+    if "차량상태" in data:
+        data["중고여부"] = data["차량상태"].ne("Brand New").astype(int)
+    if "구동방식" in data:
+        data["구동방식가중치"] = data["구동방식"].map({"AWD": 1.2, "RWD": 1.1, "FWD": 1.0})
+    if "사고이력" in data:
+        data["사고가중치"] = data["사고이력"].eq("Yes").astype(int)
     return data
 
-# train_data와 test_data에 적용
-train1 = create_improved_features(train1)
-test1 = create_improved_features(test1)
 
-# 생성된 데이터 확인
-print(train1[['제조사_모델_상태','주행거리비율','사용연한주행거리비율', '전비(km/kWh)', '중고여부','구동방식가중치', '사고가중치']])
-print(test1[['제조사_모델_상태','주행거리비율','사용연한주행거리비율', '전비(km/kWh)', '중고여부','구동방식가중치', '사고가중치']])
-
-
-import pandas as pd
-import numpy as np
-from scipy import stats
-
-features = ['제조사', '모델', '차량상태','제조사_모델_상태', '구동방식', '사고이력']
-target = '배터리용량'
-
-original_train1 = train1.copy()
-
-if train1[target].isnull().any():
-    train1 = train1.dropna(subset=[target])
-
-anova_results = {}
-for feature in features:
-    if feature in train1.columns:
-        group_data = [train1[target][train1[feature] == category] for category in train1[feature].unique()]
-        f_stat, p_value = stats.f_oneway(*group_data)
-        anova_results[feature] = (f_stat, p_value)
-
-print("ANOVA 결과 (F-statistic, p-value):")
-for feature, (f_stat, p_value) in anova_results.items():
-    print(f"{feature}: F-statistic = {f_stat}, p-value = {p_value}")
-
-significant_features = [feature for feature, (f_stat, p_value) in anova_results.items() if p_value < 0.05]
-print("유의미한 변수들:", significant_features)
-
-train1 = original_train1.copy()
-
-
-import pandas as pd
-import numpy as np
-from scipy.stats import pearsonr
-
-features = ['보증기간(년)', '연식(년)', '주행거리(km)','주행거리비율','사용연한주행거리비율', '전비(km/kWh)', '중고여부','구동방식가중치', '사고가중치']
-target = '배터리용량'
-
-original_train1 = train1.copy()
-
-train1_clean = train1.dropna(subset=[target] + features)
-
-results = {}
-for feature in features:
-    corr, p_value = pearsonr(train1_clean[feature], train1_clean[target])
-    results[feature] = {'correlation': corr, 'p-value': p_value}
-
-for feature, values in results.items():
-    print(f"{feature}: 상관계수 = {values['correlation']:.4f}, p-value = {values['p-value']:.4f}")
-
-significant_results = [feature for feature, values in results.items() if values['p-value'] < 0.05]
-print("유의미한 변수들:", significant_results)
-
-train1 = original_train1.copy()
-
-
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from xgboost import XGBRegressor
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-
-features = ['제조사', '모델', '차량상태', '구동방식', '제조사_모델_상태', '주행거리(km)', '보증기간(년)',
-            '주행거리비율', '중고여부', '구동방식가중치']
-target = '배터리용량'
-
-data_train = train1[train1[target].notnull()]
-data_missing = train1[train1[target].isnull()]
-
-X_train = data_train[features]
-y_train = data_train[target]
-X_missing = data_missing[features]
-
-categorical_cols = ['제조사', '모델', '차량상태', '구동방식', '제조사_모델_상태']
-numerical_cols = ['주행거리(km)', '보증기간(년)', '주행거리비율', '중고여부', '구동방식가중치']
-
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('num', Pipeline(steps=[
-            ('imputer', SimpleImputer(strategy='mean')),  # 결측치 평균 대체
-            ('scaler', StandardScaler())  # 스케일링
-        ]), numerical_cols),
-        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_cols)  # 원-핫 인코딩
-    ])
-
-model = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('regressor', XGBRegressor())
-])
-
-model.fit(X_train, y_train)
-
-predicted_values = model.predict(X_missing)
-
-train1.loc[train1[target].isnull(), target] = predicted_values
-
-train1['사용연한주행거리비율'] = train1['주행거리(km)'] / (train1['배터리용량'])
-train1['전비(km/kWh)'] = train1['주행거리(km)'] / (train1['배터리용량'])
-
-print(train1.info())
-
-
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from xgboost import XGBRegressor
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-
-features = ['제조사', '모델', '차량상태', '구동방식', '제조사_모델_상태', '주행거리(km)', '보증기간(년)',
-            '주행거리비율', '중고여부', '구동방식가중치']
-target = '배터리용량'
-
-data_train = test1[test1[target].notnull()]
-data_missing = test1[test1[target].isnull()]
-
-X_train = data_train[features]
-y_train = data_train[target]
-X_missing = data_missing[features]
-
-categorical_cols = ['제조사', '모델', '차량상태', '구동방식', '제조사_모델_상태']
-numerical_cols = ['주행거리(km)', '보증기간(년)', '주행거리비율', '중고여부', '구동방식가중치']
-
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('num', Pipeline(steps=[  
-            ('scaler', StandardScaler()) 
-        ]), numerical_cols),
-        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_cols)  # 원-핫 인코딩
-    ])
-
-model = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('regressor', XGBRegressor())
-])
-
-model.fit(X_train, y_train)
-
-predicted_values = model.predict(X_missing)
-
-test1.loc[test1[target].isnull(), target] = predicted_values
-
-test1['사용연한주행거리비율'] = test1['주행거리(km)'] / (test1['배터리용량'])
-test1['전비(km/kWh)'] = test1['주행거리(km)'] / (test1['배터리용량']) 
-
-print(test1.info())
-
-
-import pandas as pd
-import numpy as np
-from scipy import stats
-
-features = ['제조사', '모델', '차량상태','제조사_모델_상태', '구동방식', '사고이력']
-target = '가격(백만원)'
-
-original_train1 = train1.copy()
-
-if train1[target].isnull().any():
-    train1 = train1.dropna(subset=[target])
-
-anova_results = {}
-for feature in features:
-    if feature in train1.columns:
-        group_data = [train1[target][train1[feature] == category] for category in train1[feature].unique()]
-        f_stat, p_value = stats.f_oneway(*group_data)
-        anova_results[feature] = (f_stat, p_value)
-
-print("ANOVA 결과 (F-statistic, p-value):")
-for feature, (f_stat, p_value) in anova_results.items():
-    print(f"{feature}: F-statistic = {f_stat}, p-value = {p_value}")
-
-significant_features = [feature for feature, (f_stat, p_value) in anova_results.items() if p_value < 0.05]
-print("유의미한 변수들:", significant_features)
-
-train1 = original_train1.copy()
-
-
-import pandas as pd
-import numpy as np
-from scipy.stats import pearsonr
-
-features = ['보증기간(년)', '연식(년)','배터리용량','주행거리(km)','주행거리비율','사용연한주행거리비율', '전비(km/kWh)', '중고여부','구동방식가중치', '사고가중치']
-target = '가격(백만원)'
-
-original_train1 = train1.copy()
-
-train1_clean = train1.dropna(subset=[target] + features)
-
-results = {}
-for feature in features:
-    corr, p_value = pearsonr(train1_clean[feature], train1_clean[target])
-    results[feature] = {'correlation': corr, 'p-value': p_value}
-
-for feature, values in results.items():
-    print(f"{feature}: 상관계수 = {values['correlation']:.4f}, p-value = {values['p-value']:.4f}")
-
-significant_results = [feature for feature, values in results.items() if values['p-value'] < 0.05]
-print("유의미한 변수들:", significant_results)
-
-train1 = original_train1.copy()
-
-
-import pandas as pd
-from sklearn.metrics import mean_squared_error
-from xgboost import XGBRegressor
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-
-features = ['제조사', '모델', '차량상태', '구동방식','제조사_모델_상태', 
-            '보증기간(년)', '연식(년)', '배터리용량', '주행거리(km)', '주행거리비율',
-            '사용연한주행거리비율', '전비(km/kWh)', '중고여부', '구동방식가중치']
-target = '가격(백만원)'
-
-X_train = train1[features]
-y_train = train1[target]
-
-X_test = test1[features]
-
-categorical_cols = ['제조사', '모델', '차량상태', '구동방식','제조사_모델_상태','보증기간(년)', '연식(년)']
-numerical_cols = ['배터리용량', '주행거리(km)','주행거리비율', '사용연한주행거리비율', '전비(km/kWh)', '중고여부', '구동방식가중치']
-
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('num', Pipeline(steps=[
-            ('scaler', StandardScaler()) 
-        ]), numerical_cols),
-        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_cols)
-    ])
-
-model = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('regressor', XGBRegressor(objective='reg:squarederror', random_state=42))
-])
-
-model.fit(X_train, y_train)
-
-predicted_prices = model.predict(X_test)
-
-test1[target] = predicted_prices
-
-result = test1[['ID', '가격(백만원)']]
-print(result)
-
-result.to_csv('C:/Users/user/Desktop/open/sample_submission.csv', index=False)
+def make_preprocessor(features: pd.DataFrame) -> ColumnTransformer:
+    categorical = features.select_dtypes(include=["object", "string", "category"]).columns.tolist()
+    numeric = features.columns.difference(categorical).tolist()
+    return ColumnTransformer(
+        [("numeric", Pipeline([("imputer", SimpleImputer(strategy="median"))]), numeric),
+         ("categorical", Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", OneHotEncoder(handle_unknown="ignore"))]), categorical)],
+        remainder="drop",
+    )
+
+
+def impute_battery(reference: pd.DataFrame, *frames: pd.DataFrame) -> tuple[pd.DataFrame, ...]:
+    """Fit battery imputation on observed reference rows and apply it to all frames."""
+    all_frames = (reference, *frames)
+    if any(BATTERY not in frame for frame in all_frames):
+        return all_frames
+    predictors = [column for column in ["제조사", "모델", "차량상태", "구동방식", "주행거리(km)", "보증기간(년)"] if column in reference]
+    observed = reference.loc[reference[BATTERY].notna(), predictors]
+    if not predictors or observed.empty:
+        return all_frames
+    model = Pipeline([("preprocessor", make_preprocessor(observed)), ("regressor", XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=6, random_state=RANDOM_SEED, objective="reg:squarederror"))])
+    model.fit(observed, reference.loc[reference[BATTERY].notna(), BATTERY])
+    for frame in all_frames:
+        missing = frame[BATTERY].isna()
+        if missing.any():
+            frame.loc[missing, BATTERY] = model.predict(frame.loc[missing, predictors])
+    return all_frames
+
+
+def run(train_path: Path, test_path: Path, output_path: Path, metrics_path: Path) -> float:
+    if not train_path.is_file() or not test_path.is_file():
+        raise FileNotFoundError("Provide DACON train.csv and test.csv via --train-csv/--test-csv or EV_PRICE_DATA_DIR.")
+    train, test = pd.read_csv(train_path), pd.read_csv(test_path)
+    if TARGET not in train or ID_COLUMN not in test:
+        raise KeyError(f"Expected training target '{TARGET}' and test ID column '{ID_COLUMN}'.")
+    development, validation = train_test_split(train, test_size=TEST_SIZE, random_state=RANDOM_SEED)
+    development, validation, _ = impute_battery(development.copy(), validation.copy(), test.copy())
+    development, validation = add_features(development), add_features(validation)
+    features = [column for column in validation.columns if column != ID_COLUMN and column in development.columns and column != TARGET]
+    X_train, y_train = development[features], development[TARGET]
+    X_valid, y_valid = validation[features], validation[TARGET]
+    params = dict(n_estimators=500, learning_rate=0.05, max_depth=7, subsample=0.8, colsample_bytree=0.8, random_state=RANDOM_SEED, objective="reg:squarederror")
+    model = Pipeline([("preprocessor", make_preprocessor(X_train)), ("regressor", XGBRegressor(**params))])
+    model.fit(X_train, y_train)
+    rmse = mean_squared_error(y_valid, model.predict(X_valid)) ** 0.5
+    full_train, full_test = impute_battery(train.copy(), test.copy())
+    full_train, full_test = add_features(full_train), add_features(full_test)
+    final_features = [column for column in full_test.columns if column != ID_COLUMN and column in full_train.columns and column != TARGET]
+    final_model = Pipeline([("preprocessor", make_preprocessor(full_train[final_features])), ("regressor", XGBRegressor(**params))])
+    final_model.fit(full_train[final_features], full_train[TARGET])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({ID_COLUMN: full_test[ID_COLUMN], TARGET: final_model.predict(full_test[final_features])}).to_csv(output_path, index=False)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(json.dumps({"validation_rmse": rmse, "split": "single 80/20 random holdout", "random_seed": RANDOM_SEED}, indent=2), encoding="utf-8")
+    return rmse
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train an XGBoost EV-price model and create a submission CSV.")
+    parser.add_argument("--train-csv", type=Path, default=TRAIN_CSV)
+    parser.add_argument("--test-csv", type=Path, default=TEST_CSV)
+    parser.add_argument("--output-csv", type=Path, default=result_path("submission.csv"))
+    parser.add_argument("--metrics-json", type=Path, default=result_path("metrics.json"))
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+    print(f"Validation RMSE: {run(args.train_csv, args.test_csv, args.output_csv, args.metrics_json):.4f}")
